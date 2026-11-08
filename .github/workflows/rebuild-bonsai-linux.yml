@@ -1,0 +1,111 @@
+name: Rebuild Bonsai 0.8.6 Linux x64 (Python 3.12)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/rebuild-bonsai-linux.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pinned-bonsai-linux-0.8.6
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out historical IfcOpenShell source
+        uses: actions/checkout@v4
+        with:
+          repository: IfcOpenShell/IfcOpenShell
+          ref: 144696c8b993a8ab10b3b604a3a4509f04b5dba1
+          path: IfcOpenShell
+          persist-credentials: false
+
+      - name: Configure Python used by upstream build
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make git wget zip unzip python3-venv
+
+      - name: Verify pinned source and bundled binary reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd IfcOpenShell
+          test "$(git rev-parse HEAD)" = "144696c8b993a8ab10b3b604a3a4509f04b5dba1"
+          test "$(cat VERSION)" = "0.8.6"
+          grep -Fq 'BINARY_VERSION:=0.8.6' src/ifcopenshell-python/Makefile
+          grep -Fq 'BUILD_COMMIT:=e333c1c' src/ifcopenshell-python/Makefile
+          echo "Building original 0.8.6 sources with the pinned e333c1c IfcOpenShell binary."
+
+      - name: Recreate historical Linux py312 build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd IfcOpenShell/src/bonsai
+          make dist PLATFORM=linux PYVERSION=py312 VERSION_DATE=260823
+
+      - name: Validate Linux archive and embedded wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+          p = Path("IfcOpenShell/src/bonsai/dist/bonsai_py312-0.8.6-alpha260823-linux-x64.zip")
+          if not p.is_file():
+              raise SystemExit(f"Expected archive missing: {p}")
+          with zipfile.ZipFile(p) as z:
+              bad = z.testzip()
+              if bad:
+                  raise SystemExit(f"Corrupt archive member: {bad}")
+              names = z.namelist()
+              manifest = next((n for n in names if n.endswith("bonsai/blender_manifest.toml")), None)
+              if not manifest:
+                  raise SystemExit("Missing Blender extension manifest")
+              txt = z.read(manifest).decode("utf-8")
+              if "0.8.6-alpha260823" not in txt or "linux-x64" not in txt:
+                  raise SystemExit(f"Unexpected manifest version or platform: {txt[:800]}")
+              wheel_names = [n for n in names if n.endswith(".whl")]
+              if not any("ifcopenshell" in n.lower() and "manylinux" in n.lower() for n in wheel_names):
+                  raise SystemExit("Linux IfcOpenShell binary wheel missing")
+              if not wheel_names:
+                  raise SystemExit("No bundled dependency wheels found")
+              print(f"OK: {p.name} / {p.stat().st_size:,} bytes / {len(wheel_names)} wheels")
+          PY
+          sha256sum IfcOpenShell/src/bonsai/dist/bonsai_py312-0.8.6-alpha260823-linux-x64.zip
+
+      - name: Save build artifact even if release upload fails
+        uses: actions/upload-artifact@v4
+        with:
+          name: bonsai-py312-0.8.6-alpha260823-linux-x64
+          path: IfcOpenShell/src/bonsai/dist/bonsai_py312-0.8.6-alpha260823-linux-x64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish beside existing Windows ZIP
+        shell: bash
+        env:
+          GH_TOKEN: \${{ github.token }}
+          RELEASE_TAG: bonsai-0.8.6-alpha2608231542
+          ZIP_FILE: IfcOpenShell/src/bonsai/dist/bonsai_py312-0.8.6-alpha260823-linux-x64.zip
+        run: |
+          set -euo pipefail
+          # Publish to the existing release only; never recreate or replace the Windows build.
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          asset_name="$(basename "$ZIP_FILE")"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -Fxq "$asset_name"; then
+            echo "::notice::Linux asset already exists. Not overwriting it."
+            exit 0
+          fi
+          gh release upload "$RELEASE_TAG" "$ZIP_FILE" --repo "$GITHUB_REPOSITORY"
