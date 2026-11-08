@@ -96,7 +96,7 @@ jobs:
       - name: Publish beside existing Windows ZIP
         shell: bash
         env:
-          GH_TOKEN: \${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: bonsai-0.8.6-alpha2608231542
           ZIP_FILE: IfcOpenShell/src/bonsai/dist/bonsai_py312-0.8.6-alpha260823-linux-x64.zip
         run: |
